@@ -1,0 +1,221 @@
+
+name: Update Financial Chart History
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/3 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  update-history:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch USDT sell prices and update history
+        run: |
+          python - <<'PY'
+          import json
+          import math
+          import os
+          import time
+          import urllib.request
+          from statistics import mean
+
+          FILE = "FinancialChartHistoryauto.json"
+
+          APIS = {
+              "Nobitex": "https://apiv2.nobitex.ir/v3/orderbook/USDTIRT",
+              "Exir": "https://api.exir.io/v2/orderbook?symbol=usdt-irt",
+              "Bitpin": "https://api.bitpin.org/api/v1/mth/orderbook/USDT_IRT/",
+          }
+
+          MIN_TOMAN = 200_000
+          MAX_TOMAN = 400_000
+
+          def fetch_json(url):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "Mozilla/5.0",
+                      "Accept": "application/json",
+                      "Cache-Control": "no-cache",
+                      "Pragma": "no-cache",
+                  },
+              )
+
+              with urllib.request.urlopen(request, timeout=25) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          def find_orderbook(data, name):
+              if not isinstance(data, dict):
+                  raise ValueError("Response is not a JSON object")
+
+              if name == "Nobitex":
+                  if data.get("status") != "ok":
+                      raise ValueError("Nobitex status is not ok")
+                  return data
+
+              # Support common nested orderbook response formats.
+              candidates = [data]
+
+              for key in ("data", "result", "orderbook", "usdt-irt", "USDT-IRT"):
+                  value = data.get(key)
+                  if isinstance(value, dict):
+                      candidates.append(value)
+
+              for candidate in candidates:
+                  if isinstance(candidate.get("asks"), list):
+                      return candidate
+
+              raise ValueError("Sell orders (asks) not found")
+
+          def first_sell_price(book):
+              asks = book.get("asks")
+
+              if not isinstance(asks, list) or not asks:
+                  raise ValueError("No sell orders available")
+
+              level = asks[0]
+
+              if isinstance(level, dict):
+                  raw = level.get("price")
+              elif isinstance(level, (list, tuple)) and level:
+                  # Orderbook entry: [price, amount]
+                  raw = level[0]
+              else:
+                  raw = None
+
+              if raw is None:
+                  raise ValueError("Sell price missing")
+
+              price = float(raw)
+
+              if not math.isfinite(price) or price <= 0:
+                  raise ValueError("Invalid sell price")
+
+              return price
+
+          def normalize_toman(raw_price):
+              # Keep prices already near the expected toman range.
+              if MIN_TOMAN <= raw_price <= MAX_TOMAN:
+                  toman = raw_price
+
+              # Convert rial-denominated prices to toman only when
+              # dividing by ten produces a plausible USDT price.
+              elif (
+                  raw_price > MAX_TOMAN
+                  and MIN_TOMAN <= raw_price / 10 <= MAX_TOMAN
+              ):
+                  toman = raw_price / 10
+
+              else:
+                  raise ValueError(
+                      f"Price outside expected range: {raw_price}"
+                  )
+
+              if not MIN_TOMAN <= toman <= MAX_TOMAN:
+                  raise ValueError(f"Invalid toman price: {toman}")
+
+              return toman
+
+          prices = {}
+
+          for name, url in APIS.items():
+              try:
+                  response = fetch_json(url)
+                  book = find_orderbook(response, name)
+                  raw_price = first_sell_price(book)
+                  toman_price = normalize_toman(raw_price)
+
+                  prices[name] = toman_price
+
+                  print(
+                      f"{name}: raw sell={raw_price}, "
+                      f"sell Toman={toman_price}"
+                  )
+
+              except Exception as error:
+                  print(f"{name} FAILED: {error}")
+
+          # Do not store a partial or unreliable average.
+          if len(prices) != 3:
+              raise RuntimeError(
+                  f"Only {len(prices)}/3 valid sell prices. "
+                  "History was not changed."
+              )
+
+          average_price = mean(prices.values())
+
+          # Guard against a large disagreement between exchanges.
+          if max(prices.values()) / min(prices.values()) > 1.03:
+              raise RuntimeError(
+                  f"Sell prices differ by more than 3%: {prices}"
+              )
+
+          timestamp = int(time.time() * 1000)
+
+          data = {
+              "format": "FinancialChartHistory",
+              "version": 2,
+              "encoding": "pairs",
+              "count": 0,
+              "history": [],
+          }
+
+          if os.path.exists(FILE):
+              with open(FILE, "r", encoding="utf-8") as f:
+                  existing = json.load(f)
+
+              if (
+                  existing.get("format") != "FinancialChartHistory"
+                  or existing.get("version") != 2
+                  or existing.get("encoding") != "pairs"
+                  or not isinstance(existing.get("history"), list)
+              ):
+                  raise ValueError("Existing history format is invalid")
+
+              data = existing
+
+          history = data["history"]
+
+          if history and timestamp <= history[-1][0]:
+              timestamp = history[-1][0] + 1
+
+          history.append([timestamp, average_price])
+          data["count"] = len(history)
+
+          with open(FILE, "w", encoding="utf-8") as f:
+              json.dump(
+                  data,
+                  f,
+                  ensure_ascii=False,
+                  separators=(",", ":"),
+                  allow_nan=False,
+              )
+              f.write("\n")
+
+          print("Nobitex sell Toman:", prices["Nobitex"])
+          print("Exir sell Toman:", prices["Exir"])
+          print("Bitpin sell Toman:", prices["Bitpin"])
+          print("Average sell Toman:", average_price)
+          print("History count:", data["count"])
+          PY
+
+      - name: Commit FinancialChartHistoryauto.json
+        run: |
+          git add FinancialChartHistoryauto.json
+
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "Update financial chart history"
+            git push
+          fi
